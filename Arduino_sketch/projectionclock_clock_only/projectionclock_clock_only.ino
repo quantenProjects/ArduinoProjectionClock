@@ -45,7 +45,7 @@ void loop()
 }
 
 void showtime(DateTime time) {
-  strausgabe = "Es ist ";
+  strausgabe = "";
   strausgabe += String(time.hour());
   strausgabe += "Uhr ";
   strausgabe += String(time.minute());
