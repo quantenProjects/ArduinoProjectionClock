@@ -1,5 +1,6 @@
 //LEDmatrix projection clock
 
+#include <EEPROM.h>
 #include <LEDmatrix7219.h>
 #include <Wire.h>
 #include "RTClib.h"
@@ -9,6 +10,23 @@
 RTC_DS1307 rtc;
 // 2->DIN 3->CS 4->CLK
 LEDmatrix7219 myMatrix(2, 4, 3);
+
+//EEPROM memory structure:
+/* 0 byte = Version Number (also for checking if eeprom was cleared) = 0x02
+ * 1 - 7 bytes = placeholder for CRC or other version numbers
+ * 8 = alarmhour
+ * 9 = alarmmin
+ * 10 = dawnhour
+ * 11 = dawnmin
+ * 12 = snoozenumber
+ * 13 = snoozetime in min
+ * 14 & 15 unused
+ * 16 = chargehour begin
+ * 17 = chargehour end
+ * 18 = low battery threshold for energysaving mode (no display, no dawn, only piezo)  (format: 5V on A? /255) (not implemented yet)
+ * 
+ * 
+ */
 
 
 /*const PROGMEM prog_uchar*/byte numbers[10][4] = {
@@ -52,8 +70,8 @@ const byte ledbutton = 7;
 const byte menubutton = 8;
 const byte upbutton = 9;
 const byte downbutton = 10;
+const byte pieper = 12;
 
-const boolean usddisplay = false;
 
 boolean projectionbuttonstate = true;
 boolean ledbuttonstate = true;
@@ -66,17 +84,18 @@ boolean dimmerdir = false; //false = dimming down  true = dimming up
 
 //weekdays with alarm. su,mo,tu,we,th,fr,sa //!!WITHOUT FUNCTION!!
 boolean alarmdays[7] = {
-  true,true,true,true,true,true,false};
+  false,true,true,true,true,true,false};
 
 
 byte alarmhour = 6;
 byte alarmmin = 5;
 byte dawnhour = 5;
 byte dawnmin = 55;
-
+time_t alarmTime = AlarmHMS(alarmhour,alarmmin,0);
+time_t dawnTime = AlarmHMS(dawnhour,dawnmin,0);
 
 byte snoozeNumber = 5;
-byte snoozeTime = 5; //min
+byte snoozeTime = 2; //min
 int  executedSnooze = 0;// number of called snoozses. snoozealarm ends if executedSnooze = snoozeNumber
 
 AlarmID_t dawnalarmID;
@@ -87,8 +106,9 @@ boolean dawnalarmActive = true;
 boolean alarmActive = true;
 boolean snoozeActive = false;
 
-//extern uint8_t usd[]; //use usd for projection
-extern uint8_t TextFont[]; //use for direct display
+const boolean usddisplay = true;
+extern uint8_t usd[]; //use usd (up-side-down) for projection
+//extern uint8_t TextFont[]; //use for direct display
 
 time_t syncProvider()     //this does the same thing as RTC_DS1307::get()
 {
@@ -99,8 +119,8 @@ void setup()
 {
   myMatrix.begin(1);
   myMatrix.disableSleep();
-  //myMatrix.setFont(usd);//use usd for projection
-  myMatrix.setFont(TextFont); //use for direct display
+  myMatrix.setFont(usd);//use usd for projection
+  //myMatrix.setFont(TextFont); //use for direct display
 
 
   myMatrix.setIntensity(15);
@@ -130,13 +150,41 @@ void setup()
   pinMode(upbutton,INPUT_PULLUP);
   pinMode(downbutton,INPUT_PULLUP);
   pinMode(ledpin,OUTPUT);
-  //Serial.begin(115200);
+  pinMode(pieper,OUTPUT);
+  Serial.begin(115200);
+
+  // -----------Read EEPROM --------------
+  if (EEPROM[0] == 0x02) {
+    alarmhour = EEPROM[8];
+    alarmmin = EEPROM[9];
+    alarmTime = AlarmHMS(alarmhour,alarmmin,0);
+    dawnhour = EEPROM[10];
+    dawnmin = EEPROM[11];
+    dawnTime = AlarmHMS(dawnhour,dawnmin,0);
+    snoozeNumber = EEPROM[12];
+    snoozeTime = EEPROM[13];
+    //others not implemented yet but missing: chargehour begin & end  and low voltage treshhold
+    ledprint("read EEPROM");
+  } else {
+    ledprint("read flash");
+  }
+  //------------------------------------
+  
+  
   dawnalarmID = Alarm.alarmRepeat(dawnhour,dawnmin,0,dawnalarmHandler);
   alarmID = Alarm.alarmRepeat(alarmhour,alarmmin,0, alarmHandler);
+  /*alarmID = Alarm.alarmRepeat(1,1,0, alarmHandler);
+  Serial.println(alarmTime);
+  //alarmID = Alarm.alarmRepeat(alarmTime, alarmHandler);
+  Serial.println(Alarm.read(alarmID));
+  Alarm.write(alarmID,alarmTime);
+  Serial.println(Alarm.read(alarmID));
+  Alarm.enable(alarmID);
+  //setAlarm(alarmhour,alarmmin);*/
   snoozeID = Alarm.timerRepeat(60*snoozeTime, snoozeAlarm);
-
+  Alarm.disable(snoozeID);
   //showMenu();
-
+  //snoozeAlarm();
 }
 
 void loop()
@@ -145,7 +193,8 @@ void loop()
   //DateTime now = rtc.now();
   //while ((digitalRead(projectionbutton) == projectionbuttonstate) && (digitalRead(ledbutton) == ledbuttonstate)) {;}
   if (digitalRead(projectionbutton) != projectionbuttonstate) {
-    showtime(now());
+    //inline if: (condition ? iftrue : iffalse)
+    showtime("",now(),(snoozeActive ? " s" : ""));
     projectionbuttonstate = digitalRead(projectionbutton);
   } 
   if ( ! digitalRead(menubutton)) {//if menu button pressed
@@ -164,7 +213,7 @@ void loop()
       ledprint("dawnalarm on");
     }
   }
-  if ( ! digitalRead(downbutton)) {//if DOWN button pressed, de/activate ALARM
+  if ( ! digitalRead(downbutton)) {//if DOWN button pressed, de/activate ALARM OR deactivate SNOOZE if active 
     while (!digitalRead(downbutton)) {;}
     if (alarmActive) {
       Alarm.disable(alarmID);
@@ -188,7 +237,7 @@ void loop()
 void delayidle( long delayms) {
   while (delayms > 0) {
     checkdimmerstate(); //dimms the LED
-    checkalarm(); //check if alarm fired - UNUSED because alarmlibary
+    //checkalarm(); //check if alarm fired - UNUSED because alarmlibary
     checkledbutton(); //check if button for LED is pressed. then set vars for checkdimmerstate
     delayms -= 1;
     Alarm.delay(1); //check if alarm fired 
@@ -267,7 +316,14 @@ void alarmHandler() {
 }
 
 void snoozeAlarm() {
-  //ToDo: make noise with pieper
+  for (int i = 0;i<(executedSnooze+3);i++) {
+    for (int j = 0;j<4;j++) {
+      digitalWrite(12,HIGH);
+      delay(50);
+      digitalWrite(12,LOW);
+    }
+    delay(300);
+  }
   executedSnooze += 1;
   if (executedSnooze > snoozeNumber) {
     Alarm.disable(snoozeID);
@@ -275,47 +331,55 @@ void snoozeAlarm() {
   }
 }
 
-void showtime(DateTime time) { //print time as marquee on matrix
-  strausgabe = "";
+void showtime(String prae, DateTime time, String suff) { //print time as marquee on matrix
+  strausgabe = prae;
   strausgabe += String(time.hour());
-  strausgabe += "Uhr ";
+  strausgabe += ":";
   strausgabe += String(time.minute());
+  strausgabe += suff;
   ledprint(strausgabe);
 }
 
 void ledprint(String ausgabe) { //print string and stop marquee after 1 pass
   myMatrix.marquee(ausgabe, 100);
-  delay((ausgabe.length() * 600) + 1000);
+  //delayidle((ausgabe.length() * 600) + 1000);
+  delayidle((ausgabe.length() * 320) + 600);
   myMatrix.stopMarquee();
 }
 
-
-
-int adjustValue(byte val,byte maxVal,int minVal) { //void for adjusting val with 3 buttons and matrix. input default_val, max_var Output val
+int adjustValue(int val,byte maxVal,int minVal) { //void for adjusting val with 3 buttons and matrix. input default_val, max_var Output val
+  int speedControl = 0; //count how long up/down was pressed and then count faster
   boolean adjuDone = false;
   while (! adjuDone) {
    printNumber(int(val/10),val-(int(val/10)*10));
    while ( (digitalRead(menubutton)) && (digitalRead(upbutton)) && (digitalRead(downbutton)) ) {
       Alarm.delay(1);
+      speedControl = 0; //because released button
     }  
     if (!digitalRead(menubutton)) {
       adjuDone = true;
       while ( !(digitalRead(menubutton))) {;}      
     } 
     else if (!digitalRead(downbutton)) {
+      val -= 1; 
       if (val < minVal) {
         val = maxVal; 
-      } else {
-       val -= 1; 
-      }
+      } 
+      speedControl -= 1;
     } 
     else if (!digitalRead(upbutton)) {
       val += 1;
       if (val > maxVal) {
         val = 0; 
       }
+      speedControl += 1;
     }
-    Alarm.delay(500);
+    if (abs(speedControl) >5) {
+      speedControl = constrain(speedControl,-5,5);
+      Alarm.delay(100);
+    } else {
+      Alarm.delay(500);
+    }
   }
   return val;
 }
@@ -353,7 +417,7 @@ byte flipIfNotUSD(byte val) { // flips var, if no projetion (usd). 0..7 to 7..0
 void showMenu() { //show menu, navigate with up down, select with menu
   String ausgabe;
   int menuEntry = 0; //select first entry
-  byte menuEntryMax = 4; //max number of entries
+  byte menuEntryMax = 6; //max number of entries
   boolean menuDone = false;
   while (! menuDone) { //while no exit
 
@@ -372,6 +436,12 @@ void showMenu() { //show menu, navigate with up down, select with menu
       myMatrix.marquee("snooze number", 100);
       break;
     case 4:
+      myMatrix.marquee("write EEPROM", 100);
+      break;
+    case 5:
+      myMatrix.marquee("clear EEPROM", 100);
+      break;
+    case 6:
       myMatrix.marquee("Exit", 100);
       break;
     }
@@ -386,27 +456,51 @@ void showMenu() { //show menu, navigate with up down, select with menu
       //item select
       switch (menuEntry) {
        case 0: //set dawn time
-        ledprint("set dawn time hours");
+        ledprint("set hours");
         dawnhour = adjustValue(dawnhour,23,0);
-        ledprint("set minutes");
+        ledprint("set min");
         dawnmin = adjustValue(dawnmin,59,0);
         ausgabe =  "setted to " + String(dawnhour) + ":" + String(dawnmin);
         ledprint(ausgabe);
         menuDone = true;
-        Alarm.write(dawnalarmID,AlarmHMS(dawnhour, dawnmin,0));
+        dawnTime = AlarmHMS(dawnhour,dawnmin,0);
+        // does not trigger after write, whyever :( Alarm.write(dawnalarmID,AlarmHMS(dawnhour, dawnmin,0));
+        Alarm.free(dawnalarmID);
+        
+        dawnalarmID = Alarm.alarmRepeat(dawnhour,dawnmin,0,dawnalarmHandler);
+        
+        Alarm.enable(dawnalarmID);
         if ( ! dawnalarmActive) { //disable alarm if it was disabled befor
           Alarm.disable(dawnalarmID);
         }
         break; 
       case 1: //set alarm time
-        ledprint("set alarm time hours");
-        dawnhour = adjustValue(alarmhour,23,0);
-        ledprint("set minutes");
-        dawnmin = adjustValue(alarmmin,59,0);
+        ledprint("set hours");
+        alarmhour = adjustValue(alarmhour,23,0);
+        ledprint("set min");
+        alarmmin = adjustValue(alarmmin,59,0);
         ausgabe =  "setted to " + String(alarmhour) + ":" + String(alarmmin);
         ledprint(ausgabe);
         menuDone = true;
-        Alarm.write(alarmID,AlarmHMS(alarmhour, alarmmin,0));
+        /*Serial.println("befor");
+        Serial.println(alarmTime);
+        alarmTime = AlarmHMS(alarmhour,alarmmin,0);
+        Serial.println("val");
+        Serial.println(alarmTime);
+        Alarm.write(alarmID, alarmTime);
+        Alarm.enable(alarmID);
+        Serial.println("after");
+        Serial.println(Alarm.read(alarmID));
+        if ( ! alarmActive) { //disable alarm if it was disabled befor
+          Alarm.disable(alarmID);
+        }*/
+        alarmTime = AlarmHMS(alarmhour,alarmmin,0);
+        
+        Alarm.free(alarmID);
+        
+        alarmID = Alarm.alarmRepeat(alarmhour,alarmmin,0,alarmHandler);
+        
+        Alarm.enable(alarmID);
         if ( ! alarmActive) { //disable alarm if it was disabled befor
           Alarm.disable(alarmID);
         }
@@ -420,10 +514,28 @@ void showMenu() { //show menu, navigate with up down, select with menu
         menuDone = true;
       case 3: //set snoozeNumber
         ledprint("set snoozeNumber");
-        snoozeTime = adjustValue(snoozeNumber,59,0);
+        snoozeNumber = adjustValue(snoozeNumber,59,0);
         ledprint("setted to " + String(snoozeNumber));
         menuDone = true;
       case 4:
+        EEPROM.update(0,0x02);
+        EEPROM.update(8,alarmhour);
+        EEPROM.update(9,alarmmin);
+        EEPROM.update(10,dawnhour);
+        EEPROM.update(11,dawnmin);
+        EEPROM.update(12,snoozeNumber);
+        EEPROM.update(13,snoozeTime);
+        //others not implemented yet but missing: chargehour begin & end  and low voltage treshhold
+        ledprint("wrote EEPROM");
+        menuDone = true;
+        break;
+      case 5:
+        EEPROM.update(0,0); //clearing the version number, makes data invalid and next start, defaults from flash will be loaded
+        myMatrix.marquee("please RESET now", 100);
+        while (true) {;}
+        menuDone = true;
+        break;
+      case 6:
         menuDone = true;
         break;
       }
@@ -447,4 +559,9 @@ void showMenu() { //show menu, navigate with up down, select with menu
 
 }
 
-
+void setAlarm(byte hours,byte mins) {
+  alarmTime = AlarmHMS(hours,mins,0);
+  Alarm.write(alarmID,alarmTime);
+  //Serial.println(Alarm.read(alarmID));
+  Alarm.enable(alarmID);
+}
